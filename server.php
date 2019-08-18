@@ -24,7 +24,24 @@ $server->on('request', function($request, $response) {
 	$_POST = $request->post ?? Array();
 	$_COOKIE = $request->cookie ?? Array();
 	$_FILES = $request->files ?? Array();
+	$_REQURI = $request->server['request_uri'] ?? "/";
 	
+	$server_id = "";
+	$server_login = "";
+	if(isset($_REQURI) && $_REQURI !== "/") {
+		$server_id = str_replace("/", "", $_REQURI);
+		if(!preg_match("/^[a-z0-9]{7}$/", $server_id)) {
+			$response->end("<script>location='/';</script>");
+			return $response;
+		}
+		$server_info  = getServerInfo($server_id);
+		if(!$server_info || time() - $server_info['time'] > 15) {
+			$response->end("<script>location='/';</script>");
+			return $response;
+		}
+		$server_login = "<p class='text-center'><small>正在登陆服务器：" . htmlspecialchars($server_info['name']) . "</small></p>";
+	}
+		
 	$response->header("Server", "ZeroDream/Lfs1.0");
 	if(strtolower($request->server['request_method']) == "get") {
 		$recaptcha_key = REC_SITEKEY;
@@ -57,6 +74,7 @@ $server->on('request', function($request, $response) {
 									<div class="main-box text-left">
 										<h2 class="logo">MC reCaptcha v2</h2>
 										<p>Minecraft 我的世界服务器防压测系统</p>
+										{$server_login}
 										<hr>
 										<form method="POST">
 											<input type="hidden" id="g-recaptcha-response" name="g-recaptcha-response" />
@@ -94,7 +112,8 @@ EOF;
 						'token'     => CLIENT_PASS,
 						'action'    => 'whitelist',
 						'username'  => $_POST['username'],
-						'ip'        => $request->server['remote_addr']
+						'ip'        => $request->server['remote_addr'],
+						'serverid'  => $server_id
 					));
 					$client = new swoole_client(SWOOLE_SOCK_TCP);
 					if (!$client->connect('127.0.0.1', SERVER_SOCK, -1)) {
@@ -115,7 +134,7 @@ EOF;
 		} else {
 			$msg = "请您提交完整的信息。";
 		}
-		$response->end("<meta charset='utf-8'><script>alert('{$msg}');location='/';</script>");
+		$response->end("<meta charset='utf-8'><script>alert('{$msg}');location='{$_REQURI}';</script>");
 	}
 });
 
@@ -125,12 +144,19 @@ $table->column('id', swoole_table::TYPE_INT, 4);
 $table->column('data', swoole_table::TYPE_STRING, 2048);
 $table->create();
 
+// 创建服务器表
+$servers = new Swoole\Table(65536);
+$servers->column('id', swoole_table::TYPE_INT, 4);
+$servers->column('data', swoole_table::TYPE_STRING, 8192);
+$servers->create();
+
 // 创建 Socket TCP 服务器
 $backend = $server->listen("0.0.0.0", SERVER_SOCK, SWOOLE_SOCK_TCP);
 $backend->set(array(
 	'worker_num' => WORKERS_NUM
 ));
 $server->table = $table;
+$server->servers = $servers;
 
 // 有客户端连接
 $backend->on('connect', function ($server, $fd){
@@ -149,16 +175,29 @@ $backend->on('receive', function ($server, $fd, $from_id, $data) {
 					if(isset($json['token']) && $json['token'] == CLIENT_PASS) {
 						// 判断是否提交了用户名和 IP 地址
 						if(isset($json['username']) && isset($json['ip'])) {
+							$server_id = $json['serverid'] ?? "";
+							$server_data = json_decode($server->servers->get($server_id, 'data'), true);
 							// 写入到内存表
-							$server->table->set($json['username'], Array(
-								'data' => json_encode(Array(
+							if($server_data) {
+								$server_data['players'][$json['username']] = Array(
 									'login' => true,
 									'ip'    => $json['ip'],
 									'time'  => time()
-								))
-							));
+								);
+								$server->servers->set($server_id, Array(
+									'data' => json_encode($server_data)
+								));
+							} else {
+								$server->table->set($json['username'], Array(
+									'data' => json_encode(Array(
+										'login' => true,
+										'ip'    => $json['ip'],
+										'time'  => time()
+									))
+								));
+							}
 							// 输出日志
-							$server->send($fd, "Successful add player {$json['username']} to whitelist");
+							$server->send($fd, "Successful add player {$json['username']} to whitelist, server id: {$server_id}");
 						} else {
 							$server->send($fd, "Data undefined");
 						}
@@ -206,6 +245,72 @@ $backend->on('receive', function ($server, $fd, $from_id, $data) {
 						$server->send($fd, "Data undefined");
 					}
 					break;
+				case "register":
+					$fdinfo = $server->getClientInfo($fd);
+					$serverid = substr(md5($fdinfo['remote_ip'] . time()), 0, 7);
+					$data = $server->servers->get($serverid, 'data');
+					$server_name = $json['name'] ?? $fdinfo['remote_ip'];
+					if($data) {
+						echo "Server {$fdinfo['remote_ip']} already registed, skip...\n";
+						$server->send($fd, $serverid);
+					} else {
+						$server->servers->set($serverid, Array(
+							'data' => json_encode(Array(
+								'registed' => true,
+								'name'     => $server_name,
+								'ip'       => $fdinfo['remote_ip'],
+								'time'     => time(),
+								'players'  => Array()
+							))
+						));
+						echo "Server {$fdinfo['remote_ip']} successful registed, ID: {$serverid}\n";
+						$server->send($fd, $serverid);
+					}
+					break;
+				case "getinfo":
+					if(isset($json['token']) && $json['token'] == CLIENT_PASS) {
+						if(isset($json['serverid'])) {
+							$data = $server->servers->get($json['serverid'], 'data');
+							if($data) {
+								$data = (isset($data) && $data !== "") ? $data : "false";
+								$server->send($fd, $data);
+							} else {
+								$server->send($fd, "false");
+							}
+						} else {
+							$server->send($fd, "false");
+						}
+					} else {
+						$server->send($fd, "false");
+					}
+					break;
+				case "getlist":
+					if(isset($json['serverid']) || empty($json['serverid']) || $json['serverid'] == "null") {
+						$data = $server->servers->get($json['serverid'], 'data');
+						if($data) {
+							$data = json_decode($data, true);
+							$result = "";
+							if($data) {
+								$data['time'] = time();
+								foreach($data['players'] as $key => $value) {
+									$result .= "{$key};";
+								}
+								if($result !== "") {
+									$result = substr($result, 0, strlen($result) - 1);
+								}
+								$result = $result == "" ? "false" : $result;
+								$server->servers->set($json['serverid'], Array('data' => json_encode($data)));
+								$server->send($fd, $result);
+							} else {
+								$server->send($fd, "unregister");
+							}
+						} else {
+							$server->send($fd, "unregister");
+						}
+					} else {
+						$server->send($fd, "unregister");
+					}
+					break;
 				default:
 					// Todo
 			}
@@ -245,4 +350,25 @@ function recaptchaVerify($userdata) {
 	$result = file_get_contents('https://recaptcha.net/recaptcha/api/siteverify', false, $context);
 	$json = json_decode($result, true);
 	return $json ? $json['success'] : false;
+}
+
+function getServerInfo($id) {
+	$json = Json_Encode(Array(
+		'token'     => CLIENT_PASS,
+		'action'    => 'getinfo',
+		'serverid'  => $id
+	));
+	$client = new swoole_client(SWOOLE_SOCK_TCP);
+	if (!$client->connect('127.0.0.1', SERVER_SOCK, -1)) {
+		$client->close();
+		return false;
+	} else {
+		$client->send("{$json}\n");
+		$data = json_decode($client->recv(), true);
+		$client->close();
+		if($data) {
+			return $data;
+		}
+		return false;
+	}
 }
