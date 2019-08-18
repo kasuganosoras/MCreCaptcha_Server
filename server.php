@@ -39,7 +39,7 @@ $server->on('request', function($request, $response) {
 			$response->end("<script>location='/';</script>");
 			return $response;
 		}
-		$server_login = "<p class='text-center'><small>正在登陆服务器：" . htmlspecialchars($server_info['name']) . "</small></p>";
+		$server_login = "<p class='text-center'><small>正在登入服务器：" . htmlspecialchars($server_info['name']) . "</small></p>";
 	}
 		
 	$response->header("Server", "ZeroDream/Lfs1.0");
